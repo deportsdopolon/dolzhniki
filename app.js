@@ -1,31 +1,45 @@
-// ===== Utilities
-const APP_VERSION = "2.2"; // iPhone iOS17 UI + autosave
+// KVZ Dolzhniki PWA — v3.0 (клиенты + история операций)
+const APP_VERSION = "3.0";
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
-const fmtMoney = (n) => new Intl.NumberFormat("ru-RU", { style: "currency", currency: "RUB", maximumFractionDigits: 0 }).format(n || 0);
-const fmtDate = (iso) => iso ? new Date(iso).toLocaleDateString("ru-RU") : "—";
-const todayISO = () => new Date().toISOString().slice(0,10);
-const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : ("id-"+Math.random().toString(16).slice(2)+Date.now()));
+const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : ("id-" + Math.random().toString(16).slice(2) + Date.now()));
+const todayISO = () => new Date().toISOString().slice(0, 10);
+const fmtDate = (iso) => iso ? new Date(iso + "T12:00:00").toLocaleDateString("ru-RU") : "—";
+const fmtMoney = (n) => new Intl.NumberFormat("ru-RU", { style: "currency", currency: "RUB", maximumFractionDigits: 0 }).format(Number(n || 0));
+const clampInt = (v) => {
+  const s = String(v ?? "").replace(/[^\d-]/g, "");
+  const n = parseInt(s || "0", 10);
+  return Number.isFinite(n) ? n : 0;
+};
 
-// ===== IndexedDB
+// ===== IndexedDB (compat with v2.x stores)
 const DB_NAME = "dolzhniki_db";
-const DB_VER = 1;
+const DB_VER = 2; // bump for indexes/migrations
 
-function openDB(){
+function openDB() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VER);
     req.onupgradeneeded = () => {
       const db = req.result;
-      if(!db.objectStoreNames.contains("debtors")){
+
+      // old: "debtors" and "tx" — keep them
+      if (!db.objectStoreNames.contains("debtors")) {
         const s = db.createObjectStore("debtors", { keyPath: "id" });
-        s.createIndex("name", "name", { unique:false });
-        s.createIndex("isArchived", "isArchived", { unique:false });
+        s.createIndex("name", "name", { unique: false });
+      } else {
+        const s = req.transaction.objectStore("debtors");
+        if (!s.indexNames.contains("name")) s.createIndex("name", "name", { unique: false });
       }
-      if(!db.objectStoreNames.contains("tx")){
+
+      if (!db.objectStoreNames.contains("tx")) {
         const s = db.createObjectStore("tx", { keyPath: "id" });
-        s.createIndex("debtorId", "debtorId", { unique:false });
-        s.createIndex("date", "date", { unique:false });
+        s.createIndex("debtorId", "debtorId", { unique: false });
+        s.createIndex("date", "date", { unique: false });
+      } else {
+        const s = req.transaction.objectStore("tx");
+        if (!s.indexNames.contains("debtorId")) s.createIndex("debtorId", "debtorId", { unique: false });
+        if (!s.indexNames.contains("date")) s.createIndex("date", "date", { unique: false });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -33,7 +47,7 @@ function openDB(){
   });
 }
 
-async function idbGetAll(store){
+async function idbGetAll(store) {
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(store, "readonly");
@@ -44,7 +58,7 @@ async function idbGetAll(store){
   });
 }
 
-async function idbPut(store, obj){
+async function idbPut(store, obj) {
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(store, "readwrite");
@@ -54,7 +68,7 @@ async function idbPut(store, obj){
   });
 }
 
-async function idbDel(store, key){
+async function idbDel(store, key) {
   const db = await openDB();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(store, "readwrite");
@@ -64,522 +78,469 @@ async function idbDel(store, key){
   });
 }
 
+// ===== Persistent storage request (best-effort)
+async function tryPersist() {
+  try {
+    if (navigator.storage?.persist) await navigator.storage.persist();
+  } catch { /* ignore */ }
+}
+
 // ===== State
 let state = {
-  filter: "active", // active | overdue | closed | all
-  q: ""
+  q: "",
+  model: [],
 };
 
-// ===== Data ops
-async function getModel(){
-  const [debtors, tx] = await Promise.all([idbGetAll("debtors"), idbGetAll("tx")]);
+// ===== Model
+function normalizeTx(t) {
+  // New format:
+  // { id, debtorId, date: 'YYYY-MM-DD', amount: signed int, comment }
+  // Old format (v2): { type: 'debt'|'payment', amount: positive } => map to signed
+  let amount = Number(t.amount ?? 0);
+  if (!Number.isFinite(amount)) amount = 0;
 
-  // group tx by debtorId
+  if (typeof t.type === "string") {
+    if (t.type === "debt") amount = Math.abs(amount);
+    if (t.type === "payment") amount = -Math.abs(amount);
+  }
+  amount = Math.trunc(amount);
+
+  return {
+    id: t.id,
+    debtorId: t.debtorId,
+    date: (t.date || todayISO()).slice(0, 10),
+    amount,
+    comment: (t.comment ?? t.note ?? "").toString().trim(),
+  };
+}
+
+async function getModel() {
+  const [clientsRaw, txRaw] = await Promise.all([idbGetAll("debtors"), idbGetAll("tx")]);
+  const clients = (clientsRaw || [])
+    .filter(c => !c.isArchived) // ignore old archived clients
+    .map(c => ({
+      id: c.id,
+      name: (c.name ?? "").toString().trim(),
+      createdAt: c.createdAt || c.created || c.ts || new Date().toISOString(),
+    }))
+    .filter(c => c.name);
+
+  const tx = (txRaw || []).map(normalizeTx).filter(t => t.debtorId);
+
   const map = new Map();
-  for(const t of tx){
-    if(!map.has(t.debtorId)) map.set(t.debtorId, []);
+  for (const t of tx) {
+    if (!map.has(t.debtorId)) map.set(t.debtorId, []);
     map.get(t.debtorId).push(t);
   }
-  for(const arr of map.values()){
-    arr.sort((a,b) => (a.date||"").localeCompare(b.date||""));
+  for (const arr of map.values()) {
+    arr.sort((a, b) => (b.date || "").localeCompare(a.date || "")); // newest first
   }
 
-  const enriched = debtors.map(d => {
-    const list = map.get(d.id) || [];
-    let debt = 0, pay = 0;
-    for(const t of list){
-      if(t.type === "debt") debt += Number(t.amount||0);
-      if(t.type === "payment") pay += Number(t.amount||0);
-    }
-    const balance = debt - pay;
-
-    const due = d.dueDate ? new Date(d.dueDate) : null;
-    const now = new Date();
-    const isOverdue = !d.isArchived && due && new Date(d.dueDate+"T23:59:59") < now && balance > 0;
-
-    return { ...d, tx: list, debt, pay, balance, isOverdue };
+  const enriched = clients.map(c => {
+    const list = map.get(c.id) || [];
+    const balance = list.reduce((s, t) => s + Number(t.amount || 0), 0);
+    const lastDate = list[0]?.date || "";
+    return { ...c, balance, lastDate, entries: list };
   });
 
-  enriched.sort((a,b) => (b.balance||0) - (a.balance||0));
+  // Sort: by abs(balance) desc then name
+  enriched.sort((a, b) => (Math.abs(b.balance) - Math.abs(a.balance)) || a.name.localeCompare(b.name, "ru"));
+
   return enriched;
 }
 
-function applyFilter(items){
-  const q = (state.q||"").trim().toLowerCase();
-  return items.filter(d => {
-    const matchesQ = !q || [
-      d.name, d.phone, d.note
-    ].filter(Boolean).join(" ").toLowerCase().includes(q);
+function applySearch(items) {
+  const q = (state.q || "").trim().toLowerCase();
+  if (!q) return items;
 
-    if(!matchesQ) return false;
-
-    if(state.filter === "all") return true;
-    if(state.filter === "closed") return !!d.isArchived;
-    if(state.filter === "overdue") return !!d.isOverdue;
-    // active
-    return !d.isArchived;
+  return items.filter(c => {
+    const inName = (c.name || "").toLowerCase().includes(q);
+    if (inName) return true;
+    return (c.entries || []).some(e => (e.comment || "").toLowerCase().includes(q));
   });
 }
 
-// ===== UI render
-async function render(){
-  const model = await getModel();
-  const view = applyFilter(model);
+// ===== Modal
+const modal = {
+  open(title, bodyNode) {
+    $("#sheetTitle").textContent = title || "—";
+    const b = $("#sheetBody");
+    b.innerHTML = "";
+    b.appendChild(bodyNode);
+    $("#modal").classList.add("on");
+    $("#modal").setAttribute("aria-hidden", "false");
+  },
+  close() {
+    $("#modal").classList.remove("on");
+    $("#modal").setAttribute("aria-hidden", "true");
+    $("#sheetBody").innerHTML = "";
+  }
+};
 
-  // stats
-  const active = model.filter(d => !d.isArchived);
-  const total = active.reduce((s,d)=>s+(d.balance||0),0);
-  $("#statsLine").textContent = `Активных: ${active.length} • Сумма: ${fmtMoney(total)}`;
+// ===== UI builders
+function el(tag, cls, html) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (html != null) n.innerHTML = html;
+  return n;
+}
+
+function makeClientRow(c) {
+  const card = el("div", "card client");
+  const top = el("div", "row between");
+  const name = el("div", "cname", escapeHtml(c.name));
+  const bal = el("div", "cbal " + (c.balance > 0 ? "neg" : c.balance < 0 ? "pos" : "zero"), escapeHtml(fmtMoney(c.balance)));
+  top.append(name, bal);
+
+  const sub = el("div", "muted small", c.lastDate ? `Последняя запись: ${escapeHtml(fmtDate(c.lastDate))}` : "Нет записей");
+  card.append(top, sub);
+
+  card.addEventListener("click", () => openClient(c.id));
+  return card;
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
+}
+
+function makeEmpty() {
+  const d = el("div", "empty", 'Пусто. Нажми <b>"+"</b> чтобы добавить клиента.');
+  return d;
+}
+
+function setStats(items) {
+  const totalClients = items.length;
+  const totalDebt = items.reduce((s, c) => s + (c.balance > 0 ? c.balance : 0), 0);
+  $("#statsLine").textContent = `Клиентов: ${totalClients} · Должны: ${fmtMoney(totalDebt)}`;
+  $("#appVersion").textContent = `Версия: ${APP_VERSION}`;
+}
+
+// ===== Screens
+async function render() {
+  state.model = await getModel();
+  const shown = applySearch(state.model);
+
+  setStats(state.model);
 
   const list = $("#list");
   list.innerHTML = "";
-
-  if(view.length === 0){
-    list.innerHTML = `<div class="card"><div class="muted">Пусто. Нажми “＋” чтобы добавить должника.</div></div>`;
+  if (!shown.length) {
+    list.appendChild(makeEmpty());
     return;
   }
+  for (const c of shown) list.appendChild(makeClientRow(c));
+}
 
-  for(const d of view){
-    const badge = d.isArchived
-      ? `<span class="badge green">Закрыт</span>`
-      : d.isOverdue
-        ? `<span class="badge red">Просрочено</span>`
-        : `<span class="badge yellow">Активен</span>`;
+function openAddClient() {
+  const root = el("div", "form");
 
-    const meta = [
-      d.phone ? `Тел: ${escapeHtml(d.phone)}` : null,
-      d.dueDate ? `Срок: ${fmtDate(d.dueDate)}` : null,
-      d.note ? `Комментарий: ${escapeHtml(trimOneLine(d.note))}` : null
-    ].filter(Boolean).join(" • ");
+  root.appendChild(el("div", "label", "Имя / название"));
+  const name = el("input", "input");
+  name.placeholder = "Например: Брат / Клиент";
+  name.autocomplete = "off";
+  name.autocapitalize = "words";
+  name.spellcheck = false;
 
-    const el = document.createElement("div");
-    el.className = "card";
-    el.innerHTML = `
-      <div class="cardTop">
-        <div>
-          <div class="name">${escapeHtml(d.name || "Без имени")}</div>
-          <div class="meta">${meta || "—"}</div>
-          ${badge}
-        </div>
-        <div class="sum">${fmtMoney(d.balance)}</div>
-      </div>
+  const actions = el("div", "row between mt");
+  const btnCancel = el("button", "btn2", "Отмена");
+  const btnCreate = el("button", "btnPrimary", "Создать");
 
-      <div class="cardBtns">
-        <button class="small" data-open="${d.id}">Открыть</button>
-        <button class="small" data-pay="${d.id}">Оплата</button>
-        <button class="small" data-debt="${d.id}">+ Долг</button>
-      </div>
-    `;
-    list.appendChild(el);
+  btnCancel.type = "button";
+  btnCreate.type = "button";
+
+  actions.append(btnCancel, btnCreate);
+  root.append(name, actions);
+
+  btnCancel.addEventListener("click", () => modal.close());
+  btnCreate.addEventListener("click", async () => {
+    const n = (name.value || "").trim();
+    if (!n) {
+      name.focus();
+      return;
+    }
+    const client = { id: uuid(), name: n, createdAt: new Date().toISOString() };
+    await idbPut("debtors", client);
+    modal.close();
+    await render();
+    // open created client
+    openClient(client.id);
+  });
+
+  modal.open("Новый клиент", root);
+  setTimeout(() => name.focus(), 50);
+}
+
+async function openClient(clientId) {
+  // refresh model to include new entries before opening
+  state.model = await getModel();
+  const c = state.model.find(x => x.id === clientId);
+  if (!c) return;
+
+  const root = el("div", "clientSheet");
+
+  // Header line
+  const head = el("div", "row between mb");
+  const title = el("div", "sheetH", escapeHtml(c.name));
+  const bal = el("div", "bigBal " + (c.balance > 0 ? "neg" : c.balance < 0 ? "pos" : "zero"), escapeHtml(fmtMoney(c.balance)));
+  head.append(title, bal);
+
+  // Actions: Взял / Отдал
+  const act = el("div", "row gap mb");
+  const btnTook = el("button", "btnPrimary", "Взял");
+  const btnGave = el("button", "btn2", "Отдал");
+  btnTook.type = "button";
+  btnGave.type = "button";
+  act.append(btnTook, btnGave);
+
+  // List entries
+  const list = el("div", "history");
+  if (!c.entries.length) {
+    list.appendChild(el("div", "empty2", "Нет записей."));
+  } else {
+    for (const e of c.entries) list.appendChild(makeEntryRow(c, e));
   }
-}
 
-function escapeHtml(s){
-  return String(s ?? "").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
-}
-function trimOneLine(s){
-  const t = String(s||"").trim().replace(/\s+/g," ");
-  return t.length > 64 ? t.slice(0,64)+"…" : t;
-}
+  // Footer actions
+  const foot = el("div", "row between mt");
+  const btnDelete = el("button", "btnDanger", "Удалить клиента");
+  btnDelete.type = "button";
+  const hint = el("div", "muted small", "Тап по строке — редактировать");
+  foot.append(hint, btnDelete);
 
+  root.append(head, act, list, foot);
 
-function debounce(fn, ms){
-  let t;
-  return (...args) => {
-    clearTimeout(t);
-    t = setTimeout(() => fn(...args), ms);
-  };
-}
-// ===== Modal helpers
-let modalOnClose = null;
-function openModal(title, html, onClose){
-  modalOnClose = typeof onClose === "function" ? onClose : null;
-  $("#sheetTitle").textContent = title;
-  $("#sheetBody").innerHTML = html;
-  $("#modal").classList.add("on");
-  $("#modal").setAttribute("aria-hidden","false");
-}
-function closeModal(){
-  $("#modal").classList.remove("on");
-  $("#modal").setAttribute("aria-hidden","true");
-  try { if(modalOnClose) modalOnClose(); } catch(e){}
-  modalOnClose = null;
-}
+  btnTook.addEventListener("click", () => openEntryEditor({ client: c, mode: "took" }));
+  btnGave.addEventListener("click", () => openEntryEditor({ client: c, mode: "gave" }));
 
-// ===== Forms
-function debtorForm(d = null){
-  const isEdit = !!d;
-  const name = d?.name ?? "";
-  const phone = d?.phone ?? "";
-  const note = d?.note ?? "";
-  const dueDate = d?.dueDate ?? "";
-
-  return `
-    <div class="field">
-      <div class="fieldLabel">Имя / название</div>
-      <input class="input" id="f_name" value="${escapeHtml(name)}" placeholder="Например: Иван / Клиент" />
-    </div>
-
-    <div class="field">
-      <div class="fieldLabel">Телефон (необязательно)</div>
-      <input class="input" id="f_phone" value="${escapeHtml(phone)}" placeholder="+7..." inputmode="tel" autocomplete="new-password" autocorrect="off" autocapitalize="off" spellcheck="false" name="no_autofill_phone" />
-    </div>
-
-    <div class="field">
-      <div class="fieldLabel">Срок (необязательно)</div>
-      <input class="input" id="f_due" type="date" value="${escapeHtml(dueDate)}" />
-    </div>
-
-    <div class="field">
-      <div class="fieldLabel">Комментарий (необязательно)</div>
-      <textarea class="input" id="f_note" placeholder="Например: ремонт ноутбука, договорились до пятницы">${escapeHtml(note)}</textarea>
-      <div class="autosave" id="autosaveState">Автосохранение: —</div>
-    </div>
-
-    <div class="row" style="justify-content:space-between; gap:8px; flex-wrap:wrap">
-      ${isEdit ? `<button class="btn2" id="btnToggle">${d.isArchived ? "Сделать активным" : "Закрыть"}</button>` : `<span></span>`}
-      <div class="actions">
-        ${isEdit ? `<button class="btn2" id="btnDelete">Удалить</button>` : ``}
-        <button class="btn2" id="btnSave">${isEdit ? "Сохранить" : "Добавить"}</button>
-      </div>
-    </div>
-  `;
-}
-
-function txForm(type, debtorId){
-  return `
-    <div class="field">
-      <div class="fieldLabel">Сумма</div>
-      <input class="input" id="t_amount" inputmode="numeric" placeholder="Например: 5000" />
-    </div>
-
-    <div class="field">
-      <div class="fieldLabel">Дата</div>
-      <input class="input" id="t_date" type="date" value="${todayISO()}" />
-    </div>
-
-    <div class="field">
-      <div class="fieldLabel">Комментарий (необязательно)</div>
-      <input class="input" id="t_note" placeholder="Например: аванс" />
-    </div>
-
-    <div class="row" style="justify-content:flex-end">
-      <button class="btn2" id="btnTxSave" data-type="${type}" data-debtor="${debtorId}">Сохранить</button>
-    </div>
-  `;
-}
-
-// ===== Detail
-async function openDebtor(id){
-  const model = await getModel();
-  const d = model.find(x => x.id === id);
-  if(!d) return;
-
-  const txRows = (d.tx || []).slice().reverse().map(t => {
-    const sign = t.type === "payment" ? "−" : "+";
-    const label = t.type === "payment" ? "Оплата" : "Долг";
-    return `
-      <div class="card" style="background:#0f0f0f">
-        <div class="cardTop">
-          <div>
-            <div class="name" style="font-size:14px">${label}</div>
-            <div class="meta">${fmtDate(t.date)}${t.note ? " • " + escapeHtml(t.note) : ""}</div>
-          </div>
-          <div class="sum">${sign} ${fmtMoney(t.amount)}</div>
-        </div>
-        <div class="cardBtns">
-          <button class="small" data-deltx="${t.id}" data-open="${d.id}">Удалить операцию</button>
-        </div>
-      </div>
-    `;
-  }).join("");
-
-  openModal(
-    d.name || "Должник",
-    `
-      <div class="card">
-        <div class="cardTop">
-          <div>
-            <div class="name">${escapeHtml(d.name || "Без имени")}</div>
-            <div class="meta">
-              ${d.phone ? `Тел: ${escapeHtml(d.phone)} • ` : ``}
-              Создан: ${fmtDate(d.createdAt)}${d.dueDate ? ` • Срок: ${fmtDate(d.dueDate)}` : ``}
-            </div>
-          </div>
-          <div class="sum">${fmtMoney(d.balance)}</div>
-        </div>
-        ${d.note ? `<div class="hint" style="margin-top:10px">${escapeHtml(d.note)}</div>` : ``}
-
-        <div class="cardBtns">
-          <button class="small" data-edit="${d.id}">Изменить</button>
-          <button class="small" data-pay="${d.id}">Оплата</button>
-          <button class="small" data-debt="${d.id}">+ Долг</button>
-        </div>
-      </div>
-
-      <div class="muted" style="margin-top:6px">История операций</div>
-      ${txRows || `<div class="card"><div class="muted">Операций нет.</div></div>`}
-    `
-  );
-}
-
-async function openEditDebtor(id){
-  const debtors = await idbGetAll("debtors");
-  const d = debtors.find(x => x.id === id);
-  if(!d) return;
-
-  openModal("Редактировать", debtorForm(d));
-
-  const setAuto = (t) => { const el = $("#autosaveState"); if(el) el.textContent = t; };
-  const collect = () => ({
-      ...d,
-      name: ($("#f_name").value || "").trim(),
-      phone: ($("#f_phone").value || "").trim(),
-      dueDate: $("#f_due").value || "",
-      note: ($("#f_note").value || "").trim()
+  btnDelete.addEventListener("click", async () => {
+    if (!confirm(`Удалить клиента "${c.name}" и всю историю?`)) return;
+    // delete entries
+    for (const e of c.entries) await idbDel("tx", e.id);
+    await idbDel("debtors", c.id);
+    modal.close();
+    await render();
   });
-  const autoSave = debounce(async () => {
-    const upd = collect();
-    if(!upd.name){ setAuto("Автосохранение: укажи имя"); return; }
-    await idbPut("debtors", upd);
-    setAuto("Автосохранение: сохранено " + new Date().toLocaleTimeString("ru-RU",{hour:"2-digit",minute:"2-digit"}));
-  }, 350);
-  ["f_name","f_phone","f_due","f_note"].forEach(id => {
-    const el = $("#"+id);
-    if(!el) return;
-    el.addEventListener("input", autoSave);
-    el.addEventListener("change", autoSave);
-  });
-  setAuto("Автосохранение: включено");
 
-  $("#btnSave").onclick = async () => {
-    const upd = {
-      ...d,
-      name: ($("#f_name").value || "").trim(),
-      phone: ($("#f_phone").value || "").trim(),
-      dueDate: $("#f_due").value || "",
-      note: ($("#f_note").value || "").trim()
+  modal.open(c.name, root);
+}
+
+function makeEntryRow(client, e) {
+  const row = el("div", "entry");
+  const left = el("div", "eleft");
+  const date = el("div", "edate", escapeHtml(fmtDate(e.date)));
+  const comm = el("div", "ecomm", escapeHtml(e.comment || "—"));
+  left.append(date, comm);
+
+  const right = el("div", "eamt " + (e.amount > 0 ? "neg" : e.amount < 0 ? "pos" : "zero"), escapeHtml(fmtMoney(e.amount)));
+  row.append(left, right);
+
+  row.addEventListener("click", () => openEntryEditor({ client, entry: e, mode: e.amount >= 0 ? "took" : "gave" }));
+  return row;
+}
+
+function openEntryEditor({ client, mode, entry }) {
+  const isEdit = !!entry;
+  const root = el("div", "form");
+
+  // Amount
+  root.appendChild(el("div", "label", "Сумма"));
+  const amount = el("input", "input");
+  amount.inputMode = "numeric";
+  amount.placeholder = "Например: 10000";
+  amount.autocomplete = "off";
+
+  // Date
+  root.appendChild(el("div", "label mt2", "Дата"));
+  const date = el("input", "input");
+  date.type = "date";
+  date.value = entry?.date || todayISO();
+
+  // Comment
+  root.appendChild(el("div", "label mt2", "Комментарий (необязательно)"));
+  const comment = el("textarea", "input ta");
+  comment.placeholder = "Например: ремонт, блок питания, займ…";
+
+  // Fill
+  if (isEdit) {
+    amount.value = String(Math.abs(entry.amount || 0) || "");
+    comment.value = entry.comment || "";
+  }
+
+  const chips = el("div", "row gap mt");
+  const btnTook = el("button", "btnPrimary", "Взял");
+  const btnGave = el("button", "btn2", "Отдал");
+  btnTook.type = "button";
+  btnGave.type = "button";
+
+  // make active
+  function setMode(m) {
+    mode = m;
+    if (m === "took") {
+      btnTook.classList.add("on");
+      btnGave.classList.remove("on");
+    } else {
+      btnGave.classList.add("on");
+      btnTook.classList.remove("on");
+    }
+  }
+  setMode(mode || "took");
+
+  chips.append(btnTook, btnGave);
+
+  const meta = el("div", "muted small mt2", "Автосохранение: включено");
+
+  const actions = el("div", "row between mt");
+  const btnClose = el("button", "btn2", "Закрыть");
+  btnClose.type = "button";
+
+  const btnDel = el("button", "btnDanger", isEdit ? "Удалить" : "Очистить");
+  btnDel.type = "button";
+
+  actions.append(btnClose, btnDel);
+
+  root.append(amount, date, comment, chips, meta, actions);
+
+  // autosave (debounced)
+  let saveTimer = null;
+  let lastSaved = null;
+
+  const getPayload = () => {
+    const a = clampInt(amount.value);
+    const signed = mode === "gave" ? -Math.abs(a) : Math.abs(a);
+    return {
+      id: entry?.id || uuid(),
+      debtorId: client.id,
+      date: (date.value || todayISO()).slice(0, 10),
+      amount: signed,
+      comment: (comment.value || "").trim(),
     };
-    if(!upd.name) return alert("Укажи имя/название.");
-    await idbPut("debtors", upd);
-    closeModal();
-    await render();
   };
 
-  $("#btnToggle").onclick = async () => {
-    d.isArchived = !d.isArchived;
-    await idbPut("debtors", d);
-    closeModal();
-    await render();
-  };
+  async function doSave(force = false) {
+    const payload = getPayload();
+    const key = JSON.stringify(payload);
+    if (!force && key === lastSaved) return;
+    lastSaved = key;
 
-  $("#btnDelete").onclick = async () => {
-    if(!confirm("Удалить должника и все его операции?")) return;
-    const tx = await idbGetAll("tx");
-    for(const t of tx.filter(x => x.debtorId === id)){
-      await idbDel("tx", t.id);
+    // don't save empty new entry
+    if (!isEdit && Math.abs(payload.amount) === 0 && !payload.comment) return;
+
+    await idbPut("tx", payload);
+    entry = payload; // promote to edit state
+    // refresh the client sheet in-place by reopening (simple & reliable)
+    await openClient(client.id);
+  }
+
+  function scheduleSave() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => doSave(false), 450);
+  }
+
+  amount.addEventListener("input", scheduleSave);
+  comment.addEventListener("input", scheduleSave);
+  date.addEventListener("change", scheduleSave);
+
+  btnTook.addEventListener("click", async () => { setMode("took"); await doSave(true); });
+  btnGave.addEventListener("click", async () => { setMode("gave"); await doSave(true); });
+
+  btnClose.addEventListener("click", () => openClient(client.id));
+
+  btnDel.addEventListener("click", async () => {
+    if (entry?.id) {
+      if (!confirm("Удалить запись?")) return;
+      await idbDel("tx", entry.id);
+      await openClient(client.id);
+    } else {
+      amount.value = "";
+      comment.value = "";
+      date.value = todayISO();
     }
-    await idbDel("debtors", id);
-    closeModal();
-    await render();
-  };
-}
-
-// ===== Add debtor
-function openAddDebtor(){
-  // draft autosave (iPhone-friendly)
-  const draft = {
-    id: uuid(),
-    name: "",
-    phone: "",
-    note: "",
-    createdAt: new Date().toISOString(),
-    dueDate: "",
-    isArchived: false
-  };
-  let saved = false;
-
-  const setAuto = (t) => { const el = $("#autosaveState"); if(el) el.textContent = t; };
-  const collect = () => ({
-    ...draft,
-    name: ($("#f_name").value || "").trim(),
-    phone: ($("#f_phone").value || "").trim(),
-    dueDate: $("#f_due").value || "",
-    note: ($("#f_note").value || "").trim()
   });
 
-  openModal("Новый должник", debtorForm(null), () => {
-    // если закрыли и имя пустое — чистим черновик
-    if(saved && !draft.name) idbDel("debtors", draft.id);
-  });
-
-  // кнопка — просто закрыть (всё сохраняется автоматически)
-  $("#btnSave").textContent = "Готово";
-  $("#btnSave").onclick = async () => {
-    const cur = collect();
-    draft.name = cur.name;
-    if(!draft.name){
-      // ничего не добавили — просто закрываем
-      closeModal();
-      return;
-    }
-    // гарантируем запись перед закрытием
-    await idbPut("debtors", cur);
-    saved = true;
-    closeModal();
-    await render();
-  };
-
-  const autoSave = debounce(async () => {
-    const cur = collect();
-    draft.name = cur.name;
-    if(!cur.name){
-      setAuto("Автосохранение: укажи имя");
-      if(saved){
-        // если уже сохраняли, но стерли имя — удаляем запись
-        await idbDel("debtors", draft.id);
-        saved = false;
-      }
-      return;
-    }
-    await idbPut("debtors", cur);
-    saved = true;
-    setAuto("Автосохранение: сохранено " + new Date().toLocaleTimeString("ru-RU",{hour:"2-digit",minute:"2-digit"}));
-  }, 350);
-
-  ["f_name","f_phone","f_due","f_note"].forEach(id => {
-    const el = $("#"+id);
-    if(!el) return;
-    el.addEventListener("input", autoSave);
-    el.addEventListener("change", autoSave);
-  });
-
-  setAuto("Автосохранение: включено");
-}
-
-// ===== Add tx
-function openAddTx(type, debtorId){
-  openModal(type === "payment" ? "Оплата" : "+ Долг", txForm(type, debtorId));
-  $("#btnTxSave").onclick = async (e) => {
-    const btn = e.currentTarget;
-
-    const amount = Number(($("#t_amount").value || "").replace(/[^\d]/g,""));
-    if(!amount || amount <= 0) return alert("Укажи сумму.");
-    const date = $("#t_date").value || todayISO();
-
-    const tx = {
-      id: uuid(),
-      debtorId,
-      type,
-      amount,
-      date,
-      note: ($("#t_note").value || "").trim()
-    };
-    await idbPut("tx", tx);
-    closeModal();
-    await render();
-  };
+  modal.open(isEdit ? "Редактирование" : "Новая запись", root);
+  setTimeout(() => amount.focus(), 50);
 }
 
 // ===== Export / Import
-async function exportData(){
-  const [debtors, tx] = await Promise.all([idbGetAll("debtors"), idbGetAll("tx")]);
-  const payload = { version: 1, exportedAt: new Date().toISOString(), debtors, tx };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type:"application/json" });
-  const url = URL.createObjectURL(blob);
+async function exportJSON() {
+  const [clients, tx] = await Promise.all([idbGetAll("debtors"), idbGetAll("tx")]);
+  const payload = {
+    app: "kvz-dolzhniki",
+    version: APP_VERSION,
+    exportedAt: new Date().toISOString(),
+    clients: (clients || []).filter(c => !c.isArchived),
+    tx: (tx || []).map(normalizeTx),
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+
+  // iOS share sheet if possible
+  const file = new File([blob], `dolzhniki_backup_${new Date().toISOString().slice(0,10)}.json`, { type: "application/json" });
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [file] }) && navigator.share) {
+      await navigator.share({ files: [file], title: "Резервная копия" });
+      return;
+    }
+  } catch { /* ignore */ }
+
   const a = document.createElement("a");
-  a.href = url;
-  a.download = `dolzhniki_backup_${todayISO()}.json`;
-  document.body.appendChild(a);
+  a.href = URL.createObjectURL(blob);
+  a.download = file.name;
   a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(a.href), 1500);
 }
 
-async function importData(file){
+async function importJSON(file) {
   const text = await file.text();
-  let payload;
-  try{ payload = JSON.parse(text); } catch { return alert("Файл не JSON."); }
+  const data = JSON.parse(text);
 
-  if(!payload || !Array.isArray(payload.debtors) || !Array.isArray(payload.tx)){
-    return alert("Неверный формат файла.");
+  if (!data || !Array.isArray(data.clients) || !Array.isArray(data.tx)) {
+    alert("Неверный файл импорта.");
+    return;
   }
 
-  if(!confirm("Импорт добавит данные из файла. Продолжить?")) return;
+  if (!confirm("Импорт заменит текущие данные на телефоне. Продолжить?")) return;
 
-  for(const d of payload.debtors) await idbPut("debtors", d);
-  for(const t of payload.tx) await idbPut("tx", t);
+  // wipe existing
+  const [clientsOld, txOld] = await Promise.all([idbGetAll("debtors"), idbGetAll("tx")]);
+  for (const c of (clientsOld || [])) await idbDel("debtors", c.id);
+  for (const t of (txOld || [])) await idbDel("tx", t.id);
 
-  alert("Импорт завершён.");
+  // write new
+  for (const c of data.clients) {
+    if (c?.id && c?.name) await idbPut("debtors", { id: c.id, name: String(c.name), createdAt: c.createdAt || new Date().toISOString() });
+  }
+  for (const t of data.tx) {
+    const n = normalizeTx(t);
+    if (n?.id && n?.debtorId) await idbPut("tx", n);
+  }
+
   await render();
 }
-
-try { const v = $("#appVersion"); if(v) v.textContent = "Версия: " + APP_VERSION; } catch(e){}
-if(navigator.storage && navigator.storage.persist){ navigator.storage.persist().then((ok)=>{ /* optional */ }); }
 
 // ===== Events
-$("#btnAdd").addEventListener("click", openAddDebtor);
-$("#btnClose").addEventListener("click", closeModal);
-$("#modal").addEventListener("click", (e) => { if(e.target.id === "modal") closeModal(); });
+function bind() {
+  $("#appVersion").textContent = `Версия: ${APP_VERSION}`;
 
-$("#q").addEventListener("input", async (e) => {
-  state.q = e.target.value || "";
+  $("#q").addEventListener("input", (e) => {
+    state.q = e.target.value || "";
+    render();
+  });
+
+  $("#btnAddClient").addEventListener("click", openAddClient);
+  $("#btnClose").addEventListener("click", modal.close);
+  $("#modal").addEventListener("click", (e) => { if (e.target.id === "modal") modal.close(); });
+
+  $("#btnExport").addEventListener("click", exportJSON);
+  $("#importFile").addEventListener("change", async (e) => {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (!f) return;
+    try { await importJSON(f); } catch { alert("Ошибка импорта."); }
+  });
+}
+
+(async function init() {
+  await tryPersist();
+  bind();
   await render();
-});
-
-$$(".chip").forEach(ch => ch.addEventListener("click", async () => {
-  $$(".chip").forEach(x => x.classList.remove("chip-on"));
-  ch.classList.add("chip-on");
-  state.filter = ch.dataset.filter;
-  await render();
-}));
-
-$("#list").addEventListener("click", async (e) => {
-  const t = e.target;
-  if(!(t instanceof HTMLElement)) return;
-
-  const openId = t.getAttribute("data-open");
-  const payId = t.getAttribute("data-pay");
-  const debtId = t.getAttribute("data-debt");
-
-  if(openId) return openDebtor(openId);
-  if(payId) return openAddTx("payment", payId);
-  if(debtId) return openAddTx("debt", debtId);
-});
-
-$("#sheetBody").addEventListener("click", async (e) => {
-  const t = e.target;
-  if(!(t instanceof HTMLElement)) return;
-
-  const editId = t.getAttribute("data-edit");
-  const payId = t.getAttribute("data-pay");
-  const debtId = t.getAttribute("data-debt");
-  const delTxId = t.getAttribute("data-deltx");
-  const reopenId = t.getAttribute("data-open");
-
-  if(editId) return openEditDebtor(editId);
-  if(payId) return openAddTx("payment", payId);
-  if(debtId) return openAddTx("debt", debtId);
-
-  if(delTxId){
-    if(!confirm("Удалить операцию?")) return;
-    await idbDel("tx", delTxId);
-    if(reopenId) {
-      closeModal();
-      await render();
-      return openDebtor(reopenId);
-    }
-    closeModal();
-    await render();
-  }
-});
-
-$("#btnExport").addEventListener("click", exportData);
-$("#importFile").addEventListener("change", async (e) => {
-  const f = e.target.files?.[0];
-  e.target.value = "";
-  if(f) await importData(f);
-});
-
-// ===== First render
-render();
+})();
