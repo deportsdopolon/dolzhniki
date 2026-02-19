@@ -1,5 +1,5 @@
 // KVZ Dolzhniki PWA — v3.0 (клиенты + история операций)
-const APP_VERSION = "3.0";
+const APP_VERSION = "3.1";
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
@@ -174,6 +174,8 @@ const modal = {
     $("#modal").classList.remove("on");
     $("#modal").setAttribute("aria-hidden", "true");
     $("#sheetBody").innerHTML = "";
+    // update main screen after closing any sheet
+    try { render(); } catch { /* ignore */ }
   }
 };
 
@@ -348,17 +350,22 @@ function openEntryEditor({ client, mode, entry }) {
   amount.inputMode = "numeric";
   amount.placeholder = "Например: 10000";
   amount.autocomplete = "off";
+  amount.autocorrect = "off";
+  amount.spellcheck = false;
+  root.appendChild(amount);
 
   // Date
   root.appendChild(el("div", "label mt2", "Дата"));
   const date = el("input", "input");
   date.type = "date";
   date.value = entry?.date || todayISO();
+  root.appendChild(date);
 
   // Comment
-  root.appendChild(el("div", "label mt2", "Комментарий (необязательно)"));
+  root.appendChild(el("div", "label mt2", "За что (комментарий)"));
   const comment = el("textarea", "input ta");
-  comment.placeholder = "Например: ремонт, блок питания, займ…";
+  comment.placeholder = "Например: займ, блок питания, ремонт…";
+  root.appendChild(comment);
 
   // Fill
   if (isEdit) {
@@ -366,13 +373,13 @@ function openEntryEditor({ client, mode, entry }) {
     comment.value = entry.comment || "";
   }
 
+  // Mode chips
   const chips = el("div", "row gap mt");
   const btnTook = el("button", "btnPrimary", "Взял");
   const btnGave = el("button", "btn2", "Отдал");
   btnTook.type = "button";
   btnGave.type = "button";
 
-  // make active
   function setMode(m) {
     mode = m;
     if (m === "took") {
@@ -383,22 +390,23 @@ function openEntryEditor({ client, mode, entry }) {
       btnTook.classList.remove("on");
     }
   }
-  setMode(mode || "took");
+  setMode(mode || (entry?.amount < 0 ? "gave" : "took"));
 
   chips.append(btnTook, btnGave);
+  root.appendChild(chips);
 
   const meta = el("div", "muted small mt2", "Автосохранение: включено");
+  root.appendChild(meta);
 
   const actions = el("div", "row between mt");
-  const btnClose = el("button", "btn2", "Закрыть");
+  const btnClose = el("button", "btn2", "Готово");
   btnClose.type = "button";
 
   const btnDel = el("button", "btnDanger", isEdit ? "Удалить" : "Очистить");
   btnDel.type = "button";
 
   actions.append(btnClose, btnDel);
-
-  root.append(amount, date, comment, chips, meta, actions);
+  root.appendChild(actions);
 
   // autosave (debounced)
   let saveTimer = null;
@@ -427,8 +435,11 @@ function openEntryEditor({ client, mode, entry }) {
 
     await idbPut("tx", payload);
     entry = payload; // promote to edit state
-    // refresh the client sheet in-place by reopening (simple & reliable)
-    await openClient(client.id);
+
+    // keep client sheet fresh
+    state.model = await getModel();
+    // update background stats/list too
+    try { setStats(state.model); } catch {}
   }
 
   function scheduleSave() {
@@ -443,13 +454,16 @@ function openEntryEditor({ client, mode, entry }) {
   btnTook.addEventListener("click", async () => { setMode("took"); await doSave(true); });
   btnGave.addEventListener("click", async () => { setMode("gave"); await doSave(true); });
 
-  btnClose.addEventListener("click", () => openClient(client.id));
+  btnClose.addEventListener("click", async () => {
+    await doSave(true);
+    modal.close(); // close sheet and refresh list
+  });
 
   btnDel.addEventListener("click", async () => {
     if (entry?.id) {
       if (!confirm("Удалить запись?")) return;
       await idbDel("tx", entry.id);
-      await openClient(client.id);
+      modal.close();
     } else {
       amount.value = "";
       comment.value = "";
@@ -460,7 +474,6 @@ function openEntryEditor({ client, mode, entry }) {
   modal.open(isEdit ? "Редактирование" : "Новая запись", root);
   setTimeout(() => amount.focus(), 50);
 }
-
 // ===== Export / Import
 async function exportJSON() {
   const [clients, tx] = await Promise.all([idbGetAll("debtors"), idbGetAll("tx")]);
