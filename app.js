@@ -1,4 +1,6 @@
 // ===== Utilities
+const APP_VERSION = "2.2"; // iPhone iOS17 UI + autosave
+
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 const fmtMoney = (n) => new Intl.NumberFormat("ru-RU", { style: "currency", currency: "RUB", maximumFractionDigits: 0 }).format(n || 0);
@@ -180,8 +182,18 @@ function trimOneLine(s){
   return t.length > 64 ? t.slice(0,64)+"…" : t;
 }
 
+
+function debounce(fn, ms){
+  let t;
+  return (...args) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
+}
 // ===== Modal helpers
-function openModal(title, html){
+let modalOnClose = null;
+function openModal(title, html, onClose){
+  modalOnClose = typeof onClose === "function" ? onClose : null;
   $("#sheetTitle").textContent = title;
   $("#sheetBody").innerHTML = html;
   $("#modal").classList.add("on");
@@ -190,6 +202,8 @@ function openModal(title, html){
 function closeModal(){
   $("#modal").classList.remove("on");
   $("#modal").setAttribute("aria-hidden","true");
+  try { if(modalOnClose) modalOnClose(); } catch(e){}
+  modalOnClose = null;
 }
 
 // ===== Forms
@@ -208,7 +222,7 @@ function debtorForm(d = null){
 
     <div class="field">
       <div class="fieldLabel">Телефон (необязательно)</div>
-      <input class="input" id="f_phone" value="${escapeHtml(phone)}" placeholder="+7..." />
+      <input class="input" id="f_phone" value="${escapeHtml(phone)}" placeholder="+7..." inputmode="tel" autocomplete="new-password" autocorrect="off" autocapitalize="off" spellcheck="false" name="no_autofill_phone" />
     </div>
 
     <div class="field">
@@ -219,6 +233,7 @@ function debtorForm(d = null){
     <div class="field">
       <div class="fieldLabel">Комментарий (необязательно)</div>
       <textarea class="input" id="f_note" placeholder="Например: ремонт ноутбука, договорились до пятницы">${escapeHtml(note)}</textarea>
+      <div class="autosave" id="autosaveState">Автосохранение: —</div>
     </div>
 
     <div class="row" style="justify-content:space-between; gap:8px; flex-wrap:wrap">
@@ -315,6 +330,28 @@ async function openEditDebtor(id){
 
   openModal("Редактировать", debtorForm(d));
 
+  const setAuto = (t) => { const el = $("#autosaveState"); if(el) el.textContent = t; };
+  const collect = () => ({
+      ...d,
+      name: ($("#f_name").value || "").trim(),
+      phone: ($("#f_phone").value || "").trim(),
+      dueDate: $("#f_due").value || "",
+      note: ($("#f_note").value || "").trim()
+  });
+  const autoSave = debounce(async () => {
+    const upd = collect();
+    if(!upd.name){ setAuto("Автосохранение: укажи имя"); return; }
+    await idbPut("debtors", upd);
+    setAuto("Автосохранение: сохранено " + new Date().toLocaleTimeString("ru-RU",{hour:"2-digit",minute:"2-digit"}));
+  }, 350);
+  ["f_name","f_phone","f_due","f_note"].forEach(id => {
+    const el = $("#"+id);
+    if(!el) return;
+    el.addEventListener("input", autoSave);
+    el.addEventListener("change", autoSave);
+  });
+  setAuto("Автосохранение: включено");
+
   $("#btnSave").onclick = async () => {
     const upd = {
       ...d,
@@ -350,24 +387,74 @@ async function openEditDebtor(id){
 
 // ===== Add debtor
 function openAddDebtor(){
-  openModal("Новый должник", debtorForm(null));
+  // draft autosave (iPhone-friendly)
+  const draft = {
+    id: uuid(),
+    name: "",
+    phone: "",
+    note: "",
+    createdAt: new Date().toISOString(),
+    dueDate: "",
+    isArchived: false
+  };
+  let saved = false;
 
+  const setAuto = (t) => { const el = $("#autosaveState"); if(el) el.textContent = t; };
+  const collect = () => ({
+    ...draft,
+    name: ($("#f_name").value || "").trim(),
+    phone: ($("#f_phone").value || "").trim(),
+    dueDate: $("#f_due").value || "",
+    note: ($("#f_note").value || "").trim()
+  });
+
+  openModal("Новый должник", debtorForm(null), () => {
+    // если закрыли и имя пустое — чистим черновик
+    if(saved && !draft.name) idbDel("debtors", draft.id);
+  });
+
+  // кнопка — просто закрыть (всё сохраняется автоматически)
+  $("#btnSave").textContent = "Готово";
   $("#btnSave").onclick = async () => {
-    const name = ($("#f_name").value || "").trim();
-    if(!name) return alert("Укажи имя/название.");
-    const debtor = {
-      id: uuid(),
-      name,
-      phone: ($("#f_phone").value || "").trim(),
-      note: ($("#f_note").value || "").trim(),
-      createdAt: new Date().toISOString(),
-      dueDate: $("#f_due").value || "",
-      isArchived: false
-    };
-    await idbPut("debtors", debtor);
+    const cur = collect();
+    draft.name = cur.name;
+    if(!draft.name){
+      // ничего не добавили — просто закрываем
+      closeModal();
+      return;
+    }
+    // гарантируем запись перед закрытием
+    await idbPut("debtors", cur);
+    saved = true;
     closeModal();
     await render();
   };
+
+  const autoSave = debounce(async () => {
+    const cur = collect();
+    draft.name = cur.name;
+    if(!cur.name){
+      setAuto("Автосохранение: укажи имя");
+      if(saved){
+        // если уже сохраняли, но стерли имя — удаляем запись
+        await idbDel("debtors", draft.id);
+        saved = false;
+      }
+      return;
+    }
+    await idbPut("debtors", cur);
+    saved = true;
+    setAuto("Автосохранение: сохранено " + new Date().toLocaleTimeString("ru-RU",{hour:"2-digit",minute:"2-digit"}));
+  }, 350);
+
+  ["f_name","f_phone","f_due","f_note"].forEach(id => {
+    const el = $("#"+id);
+    if(!el) return;
+    el.addEventListener("input", autoSave);
+    el.addEventListener("change", autoSave);
+  });
+
+  setAuto("Автосохранение: включено");
 }
 
 // ===== Add tx
@@ -398,19 +485,7 @@ function openAddTx(type, debtorId){
 async function exportData(){
   const [debtors, tx] = await Promise.all([idbGetAll("debtors"), idbGetAll("tx")]);
   const payload = { version: 1, exportedAt: new Date().toISOString(), debtors, tx };
-  const json = JSON.stringify(payload, null, 2);
-
-  // iPhone-friendly: Share Sheet if available
-  try{
-    const file = new File([json], `dolzhniki_backup_${todayISO()}.json`, { type: "application/json" });
-    if(navigator.share && (!navigator.canShare || navigator.canShare({ files: [file] }))){
-      await navigator.share({ title: "Резервная копия «Должники»", files: [file] });
-      return;
-    }
-  }catch{}
-
-  // Fallback: обычная загрузка файла
-  const blob = new Blob([json], { type:"application/json" });
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type:"application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -438,6 +513,9 @@ async function importData(file){
   alert("Импорт завершён.");
   await render();
 }
+
+try { const v = $("#appVersion"); if(v) v.textContent = "Версия: " + APP_VERSION; } catch(e){}
+if(navigator.storage && navigator.storage.persist){ navigator.storage.persist().then((ok)=>{ /* optional */ }); }
 
 // ===== Events
 $("#btnAdd").addEventListener("click", openAddDebtor);
@@ -503,52 +581,5 @@ $("#importFile").addEventListener("change", async (e) => {
   if(f) await importData(f);
 });
 
-
-// ===== iPhone / PWA: persistence + install help
-async function ensurePersistentStorage(){
-  try{
-    if(navigator.storage && navigator.storage.persist){
-      await navigator.storage.persist();
-    }
-  }catch{}
-}
-
-function isIos(){
-  return /iPhone|iPad|iPod/i.test(navigator.userAgent);
-}
-function isStandalone(){
-  // iOS Safari standalone
-  return (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || (navigator.standalone === true);
-}
-
-function setupInstallBanner(){
-  const banner = $("#installBanner");
-  if(!banner) return;
-
-  // Show only on iOS Safari when not installed
-  if(isIos() && !isStandalone()){
-    banner.hidden = false;
-    $("#btnHow").onclick = () => {
-      openModal("Как установить", `
-        <div class="card">
-          <div class="muted" style="line-height:1.5">
-            1) Открой эту страницу в Safari<br/>
-            2) Нажми <b>Поделиться</b> (квадратик со стрелкой)<br/>
-            3) Выбери <b>На экран «Домой»</b><br/>
-            4) Запускай «Должники» с иконки — база будет на телефоне и офлайн.
-          </div>
-        </div>
-      `);
-    };
-  }else{
-    banner.hidden = true;
-  }
-}
-
-
 // ===== First render
-ensurePersistentStorage().finally(() => {
-  setupInstallBanner();
-  render();
-});
-
+render();
