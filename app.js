@@ -398,7 +398,19 @@ function openAddTx(type, debtorId){
 async function exportData(){
   const [debtors, tx] = await Promise.all([idbGetAll("debtors"), idbGetAll("tx")]);
   const payload = { version: 1, exportedAt: new Date().toISOString(), debtors, tx };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type:"application/json" });
+  const json = JSON.stringify(payload, null, 2);
+
+  // iPhone-friendly: Share Sheet if available
+  try{
+    const file = new File([json], `dolzhniki_backup_${todayISO()}.json`, { type: "application/json" });
+    if(navigator.share && (!navigator.canShare || navigator.canShare({ files: [file] }))){
+      await navigator.share({ title: "Резервная копия «Должники»", files: [file] });
+      return;
+    }
+  }catch{}
+
+  // Fallback: обычная загрузка файла
+  const blob = new Blob([json], { type:"application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -491,5 +503,52 @@ $("#importFile").addEventListener("change", async (e) => {
   if(f) await importData(f);
 });
 
+
+// ===== iPhone / PWA: persistence + install help
+async function ensurePersistentStorage(){
+  try{
+    if(navigator.storage && navigator.storage.persist){
+      await navigator.storage.persist();
+    }
+  }catch{}
+}
+
+function isIos(){
+  return /iPhone|iPad|iPod/i.test(navigator.userAgent);
+}
+function isStandalone(){
+  // iOS Safari standalone
+  return (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || (navigator.standalone === true);
+}
+
+function setupInstallBanner(){
+  const banner = $("#installBanner");
+  if(!banner) return;
+
+  // Show only on iOS Safari when not installed
+  if(isIos() && !isStandalone()){
+    banner.hidden = false;
+    $("#btnHow").onclick = () => {
+      openModal("Как установить", `
+        <div class="card">
+          <div class="muted" style="line-height:1.5">
+            1) Открой эту страницу в Safari<br/>
+            2) Нажми <b>Поделиться</b> (квадратик со стрелкой)<br/>
+            3) Выбери <b>На экран «Домой»</b><br/>
+            4) Запускай «Должники» с иконки — база будет на телефоне и офлайн.
+          </div>
+        </div>
+      `);
+    };
+  }else{
+    banner.hidden = true;
+  }
+}
+
+
 // ===== First render
-render();
+ensurePersistentStorage().finally(() => {
+  setupInstallBanner();
+  render();
+});
+

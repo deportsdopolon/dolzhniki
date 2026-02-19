@@ -160,3 +160,49 @@ body{
 .field{display:flex; flex-direction:column}
 textarea.input{min-height:80px; resize:vertical}
 hr{border:none;border-top:1px solid var(--line); margin:6px 0}
+
+
+/* ===== iPhone / PWA polish */
+:root{
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+body{
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+.topbar{
+  padding-top: calc(14px + var(--safe-top));
+}
+
+.wrap{
+  padding-bottom: calc(24px + var(--safe-bottom));
+}
+
+.btn, .btn2, .small, .chip{
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+#btnAdd{
+  width:44px;
+  height:44px;
+  border-radius:14px;
+  font-size:22px;
+  line-height:1;
+}
+
+.install{
+  border-style: dashed;
+}
+.installTitle{
+  font-weight:700;
+  margin-bottom:4px;
+}
+
+/* Make cards feel more iOS-like */
+.card{
+  box-shadow: 0 6px 22px rgba(0,0,0,.25);
+}
