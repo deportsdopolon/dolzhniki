@@ -1,5 +1,5 @@
 // KVZ Dolzhniki PWA — v3.0 (клиенты + история операций)
-const APP_VERSION = "3.1";
+const APP_VERSION = "3.2";
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
@@ -543,13 +543,7 @@ function bind() {
   $("#btnClose").addEventListener("click", modal.close);
   $("#modal").addEventListener("click", (e) => { if (e.target.id === "modal") modal.close(); });
 
-  $("#btnExport").addEventListener("click", exportJSON);
-  $("#importFile").addEventListener("change", async (e) => {
-    const f = e.target.files?.[0];
-    e.target.value = "";
-    if (!f) return;
-    try { await importJSON(f); } catch { alert("Ошибка импорта."); }
-  });
+  $("#btnBackup").addEventListener("click", exportJSON);
 }
 
 (async function init() {

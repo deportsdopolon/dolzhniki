@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover" />
   <meta name="theme-color" content="#0b0b0b" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -20,7 +20,7 @@
         <div class="sub" id="statsLine">—</div>
       </div>
     </div>
-    <button class="btn" id="btnAddClient" type="button" aria-label="Добавить клиента">＋</button>
+    <div class="topActions"><button class="btn ghost" id="btnBackup" type="button" aria-label="Сохранить копию">⤓</button><button class="btn" id="btnAddClient" type="button" aria-label="Добавить клиента">＋</button></div>
   </header>
 
   <main class="wrap">
@@ -31,23 +31,7 @@
     </section>
 
     <section class="list" id="list"></section>
-
-    <section class="panel">
-      <div class="row between">
-        <div class="muted">Резервная копия</div>
-        <div class="actions">
-          <button class="btn2" id="btnExport" type="button">Экспорт</button>
-          <label class="btn2">
-            Импорт
-            <input id="importFile" type="file" accept="application/json" hidden />
-          </label>
-        </div>
-      </div>
-      <div class="hint">
-        Данные хранятся <b>только на телефоне</b> (IndexedDB). Экспорт — на случай переустановки.
-        <div class="version" id="appVersion">Версия —</div>
-      </div>
-    </section>
+  <div class="footerLine"><span id="appVersion">Версия —</span></div>
   </main>
 
   <!-- Modal -->

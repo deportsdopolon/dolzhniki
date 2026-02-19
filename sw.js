@@ -1,4 +1,4 @@
-const CACHE = "dolzhniki-v31";
+const CACHE = "kvz-dolzhniki-v3.2";
 const ASSETS = ["./", "./index.html", "./styles.css", "./app.js", "./manifest.json", "./icon.svg"];
 
 self.addEventListener("install", (e) => {
