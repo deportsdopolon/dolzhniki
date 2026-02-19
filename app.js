@@ -87,7 +87,6 @@ async function tryPersist() {
 
 // ===== State
 let state = {
-  q: "",
   model: [],
 };
 
@@ -149,16 +148,7 @@ async function getModel() {
   return enriched;
 }
 
-function applySearch(items) {
-  const q = (state.q || "").trim().toLowerCase();
-  if (!q) return items;
-
-  return items.filter(c => {
-    const inName = (c.name || "").toLowerCase().includes(q);
-    if (inName) return true;
-    return (c.entries || []).some(e => (e.comment || "").toLowerCase().includes(q));
-  });
-}
+// (v3.3) Поиска нет — список всегда полный
 
 // ===== Modal
 const modal = {
@@ -220,7 +210,7 @@ function setStats(items) {
 // ===== Screens
 async function render() {
   state.model = await getModel();
-  const shown = applySearch(state.model);
+  const shown = state.model;
 
   setStats(state.model);
 
@@ -238,7 +228,7 @@ function openAddClient() {
 
   root.appendChild(el("div", "label", "Имя / название"));
   const name = el("input", "input");
-  name.placeholder = "Например: Брат / Клиент";
+  name.placeholder = "Например: Должник";
   name.autocomplete = "off";
   name.autocapitalize = "words";
   name.spellcheck = false;
@@ -487,10 +477,53 @@ async function exportJSON() {
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
 
   // iOS share sheet if possible
-  const file = new File([blob], `dolzhniki_backup_${new Date().toISOString().slice(0,10)}.json`, { type: "application/json" });
+  const file = new File([blob], "backup.json", { type: "application/json" });
   try {
     if (navigator.canShare && navigator.canShare({ files: [file] }) && navigator.share) {
       await navigator.share({ files: [file], title: "Резервная копия" });
+      return;
+    }
+  } catch { /* ignore */ }
+
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = file.name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+}
+
+async function exportTXT() {
+  const model = await getModel();
+  const lines = [];
+  lines.push("Должники — экспорт");
+  lines.push(`Версия: ${APP_VERSION}`);
+  lines.push(`Дата: ${new Date().toISOString()}`);
+  lines.push("");
+
+  for (const c of model) {
+    const bal = c.balance || 0;
+    lines.push(`${c.name} — ${fmtMoney(bal)}`);
+    if (!c.entries?.length) {
+      lines.push("  (нет записей)");
+      lines.push("");
+      continue;
+    }
+    for (const e of c.entries) {
+      const sign = (e.amount || 0) >= 0 ? "+" : "-";
+      const abs = Math.abs(Number(e.amount || 0));
+      const money = fmtMoney(abs);
+      const comment = (e.comment || "").trim();
+      lines.push(`  • ${e.date}  ${sign}${money}${comment ? "  — " + comment : ""}`);
+    }
+    lines.push("");
+  }
+
+  const blob = new Blob([lines.join("\n")], { type: "text/plain;charset=utf-8" });
+  const file = new File([blob], "export.txt", { type: "text/plain" });
+
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [file] }) && navigator.share) {
+      await navigator.share({ files: [file], title: "Экспорт" });
       return;
     }
   } catch { /* ignore */ }
@@ -534,16 +567,35 @@ async function importJSON(file) {
 function bind() {
   $("#appVersion").textContent = `Версия: ${APP_VERSION}`;
 
-  $("#q").addEventListener("input", (e) => {
-    state.q = e.target.value || "";
-    render();
-  });
-
   $("#btnAddClient").addEventListener("click", openAddClient);
   $("#btnClose").addEventListener("click", modal.close);
   $("#modal").addEventListener("click", (e) => { if (e.target.id === "modal") modal.close(); });
 
-  $("#btnBackup").addEventListener("click", exportJSON);
+  // ⤓: короткое нажатие — backup.json, долгое — export.txt
+  const btn = $("#btnBackup");
+  let longTimer = null;
+  let longFired = false;
+
+  const startLong = () => {
+    clearTimeout(longTimer);
+    longFired = false;
+    longTimer = setTimeout(async () => {
+      longFired = true;
+      try { await exportTXT(); } catch (e) { console.error(e); }
+    }, 550);
+  };
+
+  const endPress = async () => {
+    clearTimeout(longTimer);
+    if (!longFired) {
+      try { await exportJSON(); } catch (e) { console.error(e); }
+    }
+  };
+
+  btn.addEventListener("pointerdown", (e) => { if (e.button === 0) startLong(); });
+  btn.addEventListener("pointerup", endPress);
+  btn.addEventListener("pointercancel", () => { clearTimeout(longTimer); });
+  btn.addEventListener("contextmenu", (e) => e.preventDefault());
 }
 
 (async function init() {
